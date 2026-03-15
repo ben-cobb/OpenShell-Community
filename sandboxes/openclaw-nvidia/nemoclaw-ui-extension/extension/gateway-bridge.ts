@@ -14,6 +14,9 @@ interface ConfigSnapshot {
   [key: string]: unknown;
 }
 
+const CONNECTION_POLL_INTERVAL_MS = 200;
+const BLOCKING_GATEWAY_MESSAGE_RE = /(pairing required|origin not allowed)/i;
+
 /**
  * Returns the live GatewayBrowserClient from the <openclaw-app> element,
  * or null if the app hasn't connected yet.
@@ -26,7 +29,7 @@ export function getClient(): GatewayClient | null {
 }
 
 /**
- * Wait until the gateway client is available (polls every 500ms, up to timeoutMs).
+ * Wait until the gateway client is available, up to timeoutMs.
  */
 export function waitForClient(timeoutMs = 15_000): Promise<GatewayClient> {
   return new Promise((resolve, reject) => {
@@ -46,7 +49,7 @@ export function waitForClient(timeoutMs = 15_000): Promise<GatewayClient> {
         clearInterval(interval);
         reject(new Error("Timed out waiting for OpenClaw gateway client"));
       }
-    }, 500);
+    }, CONNECTION_POLL_INTERVAL_MS);
   });
 }
 
@@ -87,11 +90,37 @@ export function isAppConnected(): boolean {
   return app?.connected === true;
 }
 
+function collectVisibleText(root: ParentNode | ShadowRoot | null): string {
+  if (!root) return "";
+  const chunks: string[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+
+  let node: Node | null = walker.currentNode;
+  while (node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent?.trim();
+      if (text) chunks.push(text);
+    } else if (node instanceof Element && node.shadowRoot) {
+      const shadowText = collectVisibleText(node.shadowRoot);
+      if (shadowText) chunks.push(shadowText);
+    }
+    node = walker.nextNode();
+  }
+
+  return chunks.join(" ");
+}
+
+export function hasBlockingGatewayMessage(): boolean {
+  const app = document.querySelector("openclaw-app") as (HTMLElement & { shadowRoot?: ShadowRoot | null }) | null;
+  if (!app) return false;
+  const text = `${collectVisibleText(app)} ${collectVisibleText(app.shadowRoot ?? null)}`;
+  return BLOCKING_GATEWAY_MESSAGE_RE.test(text);
+}
+
 /**
  * Wait for the gateway to reconnect after a restart (e.g. after config.patch).
  *
- * Polls <openclaw-app>.connected every 500ms. Resolves when the app is
- * connected again, or rejects after timeoutMs.
+ * Resolves when the app is connected again, or rejects after timeoutMs.
  */
 export function waitForReconnect(timeoutMs = 15_000): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -109,7 +138,7 @@ export function waitForReconnect(timeoutMs = 15_000): Promise<void> {
         clearInterval(interval);
         reject(new Error("Timed out waiting for gateway to reconnect"));
       }
-    }, 500);
+    }, CONNECTION_POLL_INTERVAL_MS);
   });
 }
 
@@ -125,26 +154,45 @@ export function waitForStableConnection(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    let connectedSince = isAppConnected() ? Date.now() : 0;
+    let healthySince = 0;
+    let cancelled = false;
 
-    const interval = setInterval(() => {
+    const tick = async () => {
+      if (cancelled) return;
       const now = Date.now();
 
-      if (isAppConnected()) {
-        if (!connectedSince) connectedSince = now;
-        if (now - connectedSince >= stableForMs) {
-          clearInterval(interval);
-          resolve();
-          return;
-        }
+      if (!isAppConnected() || hasBlockingGatewayMessage()) {
+        healthySince = 0;
       } else {
-        connectedSince = 0;
+        const client = getClient();
+        if (!client) {
+          healthySince = 0;
+        } else {
+          try {
+            await client.request("status", {});
+            if (!healthySince) healthySince = now;
+            if (now - healthySince >= stableForMs) {
+              cancelled = true;
+              resolve();
+              return;
+            }
+          } catch {
+            healthySince = 0;
+          }
+        }
       }
 
       if (now - start > timeoutMs) {
-        clearInterval(interval);
-        reject(new Error("Timed out waiting for stable gateway connection"));
+        cancelled = true;
+        reject(new Error("Timed out waiting for stable operational gateway connection"));
+        return;
       }
-    }, 500);
+
+      window.setTimeout(() => {
+        void tick();
+      }, CONNECTION_POLL_INTERVAL_MS);
+    };
+
+    void tick();
   });
 }
